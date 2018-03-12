@@ -40,6 +40,7 @@
 # include "config.h"
 #endif
 
+#include <linux/if_ether.h>
 #include <assert.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -1554,6 +1555,9 @@ static Packet s_packet;
 static DAQ_PktHdr_t s_pkth;
 static uint8_t s_data[65536];
 
+/* Inner pkt stuff */
+static Packet *inner_pkt = NULL;
+
 static DAQ_Verdict PacketCallback(
     void* user, const DAQ_PktHdr_t* pkthdr, const uint8_t* pkt)
 {
@@ -1765,6 +1769,107 @@ static void PrintPacket(Packet *p)
 #endif  // NO_NON_ETHER_DECODER
 }
 
+DAQ_Verdict ProcessPacket_SR(
+    Packet* p, const DAQ_PktHdr_t* pkthdr, const uint8_t* pkt, void* ft, int family)
+{
+    DAQ_Verdict verdict = DAQ_VERDICT_PASS;
+
+    // set runtime policy to default...idx is same for both nap & ips
+    setNapRuntimePolicy(getDefaultPolicy());
+    setIpsRuntimePolicy(getDefaultPolicy());
+
+    /* call the right packet decoder */
+    switch (family)
+    {
+    case AF_INET:
+        DecodeRawPkt(p, pkthdr, pkt);
+        break;
+    case AF_INET6:
+        DecodeRawPkt6(p, pkthdr, pkt);
+        break;
+    }
+
+    assert(p->pkth && p->pkt);
+
+    if (ft)
+    {
+        p->packet_flags |= (PKT_PSEUDO | PKT_REBUILT_FRAG);
+        p->pseudo_type = PSEUDO_PKT_IP;
+        p->fragtracker = ft;
+        Encode_SetPkt(p);
+    }
+    if ( !p->proto_bits )
+        p->proto_bits = PROTO_BIT__OTHER;
+
+    // required until decoders are fixed
+    else if ( !p->family && (p->proto_bits & PROTO_BIT__IP) )
+        p->proto_bits &= ~PROTO_BIT__IP;
+
+    /***** Policy specific decoding should into this function *****/
+    p->configPolicyId = snort_conf->targeted_policies[ getNapRuntimePolicy() ]->configPolicyId;
+
+#if defined(HAVE_DAQ_EXT_MODFLOW) && defined(HAVE_DAQ_PKT_TRACE)
+    if (pkt_trace_cli_flag || (pkthdr->flags & DAQ_PKT_FLAG_TRACE_ENABLED))
+#else
+    if (pkt_trace_cli_flag)
+#endif
+    {
+        pkt_trace_enabled = pktTracerDebugCheck(p);
+        if (pkt_trace_enabled)
+        {
+            addPktTraceInfo(p);
+            if (p->packet_flags & PKT_IGNORE)
+                addPktTraceData(VERDICT_REASON_SNORT, snprintf(trace_line, MAX_TRACE_LINE, "Snort: packet ignored\n"));
+        }
+    }
+    else
+        pkt_trace_enabled = false;
+
+    /* just throw away the packet if we are configured to ignore this port */
+    if ( !(p->packet_flags & PKT_IGNORE) )
+    {
+        /* start calling the detection processes */
+        Preprocess(p);
+        log_func(p);
+    }
+    else if (!pkt_trace_enabled) // ignored packet
+        addPktTraceData(VERDICT_REASON_SNORT, 0);
+
+    if ( Active_SessionWasDropped() )
+    {
+        if ( !Active_PacketForceDropped() )
+            Active_DropAction(p);
+        else
+            Active_ForceDropAction(p);
+
+        if ( Active_GetTunnelBypass() )
+            pc.internal_blacklist++;
+        else if ( ScIpsInlineMode() || Active_PacketForceDropped() )
+    {
+            verdict = DAQ_VERDICT_BLACKLIST;
+    }
+        else
+            verdict = DAQ_VERDICT_IGNORE;
+    }
+
+#ifdef CONTROL_SOCKET
+    if (packet_dump_stop)
+        PacketDumpClose();
+    else if (packet_dump_file &&
+#ifdef HAVE_DAQ_ADDRESS_SPACE_ID
+             pkthdr->address_space_id == packet_dump_address_space_id &&
+#endif
+             (!packet_dump_fcode.bf_insns || sfbpf_filter(packet_dump_fcode.bf_insns, (uint8_t *)pkt,
+                                                          pkthdr->caplen, pkthdr->pktlen)))
+    {
+        pcap_dump((uint8_t*)packet_dump_file, (const struct pcap_pkthdr*)pkthdr, pkt);
+        pcap_dump_flush((pcap_dumper_t*)packet_dump_file);
+    }
+#endif
+
+    return verdict;
+}
+
 DAQ_Verdict ProcessPacket(
     Packet* p, const DAQ_PktHdr_t* pkthdr, const uint8_t* pkt, void* ft)
 {
@@ -1777,6 +1882,47 @@ DAQ_Verdict ProcessPacket(
     /* call the packet decoder */
     (*grinder) (p, pkthdr, pkt);
     assert(p->pkth && p->pkt);
+
+    /* SR work starts here */
+    if (p->encapsulated && p->outer_ip_dsize)
+    {
+        int trim_size = 0;
+        int ethlen =0;
+        if (p->eh != NULL)
+            ethlen = 14;
+
+        /* calculating the size of the outer encapsualtion */
+        switch (p->family)
+        {
+        case AF_INET:
+            /* Here a quick fix for Inner IPv4 packets */
+            trim_size = p->outer_ip_dsize - (p->ip_dsize - 20) + ethlen;
+            break;
+        case AF_INET6:
+            trim_size = p->outer_ip_dsize - (p->ip_dsize) + ethlen;
+	         break;
+        }
+
+        DAQ_PktHdr_t inner_pkt_hdr;
+        Packet *inner_p = NewGrinderPkt(inner_pkt, NULL, NULL);
+        inner_pkt = inner_p;
+        memset(&inner_pkt_hdr, 0, sizeof(inner_pkt_hdr));
+        inner_pkt_hdr.ts.tv_sec = pkthdr->ts.tv_sec;
+        inner_pkt_hdr.ts.tv_usec = pkthdr->ts.tv_usec;
+        inner_pkt_hdr.caplen = (pkthdr->caplen) - trim_size;
+        inner_pkt_hdr.pktlen = (pkthdr->pktlen) - trim_size;
+        inner_pkt_hdr.ingress_index = pkthdr->ingress_index;
+        inner_pkt_hdr.egress_index = pkthdr->egress_index;
+        inner_pkt_hdr.ingress_group= pkthdr->ingress_group;
+        inner_pkt_hdr.egress_group = pkthdr->egress_group;
+
+        /* Passing the inner packet to the SR processing engine of snort */
+        int ret =ProcessPacket_SR(inner_pkt, &inner_pkt_hdr,pkt+trim_size, NULL, p->family);
+        DeleteGrinderPkt(inner_pkt);
+        inner_pkt = NULL;
+        return ret;
+    }
+    /* SR work ends here */
 
     if (ft)
     {

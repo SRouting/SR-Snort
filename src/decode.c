@@ -3770,6 +3770,17 @@ void DecodeIPV6Options(int type, const uint8_t *pkt, uint32_t len, Packet *p)
                 return;
             }
 
+            /* Routing type 4 extension headers are nice. We like them.*/
+            {
+                IP6Route *rte = (IP6Route *)exthdr;
+
+                if (rte->ip6rte_type == 4)
+                {
+                    hdrlen = sizeof(IP6Extension) + (exthdr->ip6e_len << 3);
+                    break;
+                }
+            }
+
             /* Routing type 0 extension headers are evil creatures. */
             {
                 IP6Route *rte = (IP6Route *)exthdr;
